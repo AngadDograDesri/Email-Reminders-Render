@@ -1,0 +1,48 @@
+databases:
+  - name: email-reminders-db
+    databaseName: email_reminders
+    user: email_reminders_user
+    plan: free
+
+services:
+  # Web service for the "Mark as Dealt With" API
+  - type: web
+    name: email-reminders-api
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python mark_dealt_with_api.py
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: email-reminders-db
+          property: connectionString
+      - key: WEBHOOK_HOST
+        value: 0.0.0.0
+      - key: WEBHOOK_PORT
+        value: 10000
+      - key: AUTO_CLEANUP_DAYS
+        value: 14
+      - key: WEBHOOK_API_KEY
+        generateValue: true
+    healthCheckPath: /api/health
+
+  # Cron job for email reminders - runs at 5:30 PM IST (12:00 UTC) daily
+  - type: cron
+    name: email-reminders-cron
+    runtime: python
+    schedule: "0 12 * * *"
+    buildCommand: pip install -r requirements.txt
+    startCommand: python email_followup_graph_multi_user_v2.py
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: email-reminders-db
+          property: connectionString
+      - key: WEBHOOK_API_URL
+        fromService:
+          type: web
+          name: email-reminders-api
+          property: url
+      - key: USE_EXCLUSION_API
+        value: true

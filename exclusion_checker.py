@@ -4,10 +4,10 @@ Can be imported by the main analysis script when ready to integrate.
 """
 
 import os
-import sqlite3
 import requests
 from typing import Optional
 from dotenv import load_dotenv
+from db_utils import check_exclusion_exists
 
 # Load environment variables
 try:
@@ -16,7 +16,6 @@ except ImportError:
     pass
 
 # Configuration
-DB_PATH = os.getenv("EXCLUSIONS_DB_PATH", "excluded_instances.db")
 WEBHOOK_API_URL = os.getenv("WEBHOOK_API_URL", "http://localhost:5000")
 USE_API = os.getenv("USE_EXCLUSION_API", "false").lower() == "true"  # Set to "true" to use API instead of direct DB
 
@@ -71,25 +70,8 @@ def _check_via_api(conversation_id: str, latest_message_id: str, user_email: str
 
 def _check_via_db(conversation_id: str, latest_message_id: str, user_email: str) -> bool:
     """Check exclusion via direct database access."""
-    if not os.path.exists(DB_PATH):
-        return False
-    
     try:
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        
-        cursor.execute("""
-            SELECT id FROM excluded_instances
-            WHERE conversation_id = ? 
-            AND latest_message_id = ? 
-            AND user_email = ?
-        """, (conversation_id, latest_message_id, user_email.lower()))
-        
-        result = cursor.fetchone()
-        conn.close()
-        
-        return result is not None
-        
+        return check_exclusion_exists(conversation_id, latest_message_id, user_email)
     except Exception as e:
         print(f"  Warning: Database check error: {str(e)}")
         return False
@@ -143,34 +125,9 @@ def _mark_via_api(conversation_id: str, latest_message_id: str, user_email: str,
 def _mark_via_db(conversation_id: str, latest_message_id: str, user_email: str, reason: Optional[str] = None) -> bool:
     """Mark exclusion via direct database access."""
     try:
-        from datetime import datetime
-        
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        
-        # Ensure table exists
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS excluded_instances (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                conversation_id TEXT NOT NULL,
-                latest_message_id TEXT NOT NULL,
-                user_email TEXT NOT NULL,
-                excluded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                reason TEXT,
-                UNIQUE(conversation_id, latest_message_id, user_email)
-            )
-        """)
-        
-        cursor.execute("""
-            INSERT OR REPLACE INTO excluded_instances 
-            (conversation_id, latest_message_id, user_email, excluded_at, reason)
-            VALUES (?, ?, ?, ?, ?)
-        """, (conversation_id, latest_message_id, user_email.lower(), datetime.utcnow().isoformat(), reason))
-        
-        conn.commit()
-        conn.close()
+        from db_utils import add_exclusion
+        add_exclusion(conversation_id, latest_message_id, user_email, reason)
         return True
-        
     except Exception as e:
         print(f"  Warning: Database mark error: {str(e)}")
         return False

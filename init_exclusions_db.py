@@ -1,10 +1,9 @@
 """
 Database Initialization Script for Excluded Instances
-Run this once to set up the SQLite database schema.
+Run this once to set up the database schema (PostgreSQL or SQLite).
 """
 
 import os
-import sqlite3
 import sys
 
 # Fix Windows console encoding
@@ -18,63 +17,26 @@ try:
 except ImportError:
     print("Warning: python-dotenv not installed. Make sure to set environment variables manually.")
 
-DB_PATH = os.getenv("EXCLUSIONS_DB_PATH", "excluded_instances.db")
+from db_utils import init_database, get_total_exclusions, IS_POSTGRES
 
 
-def init_database():
-    """Initialize the SQLite database with the required schema."""
-    print(f"Initializing database at: {DB_PATH}")
+def setup_database():
+    """Initialize the database with the required schema."""
+    db_type = "PostgreSQL" if IS_POSTGRES else "SQLite"
+    print(f"Initializing {db_type} database...")
     
-    # Create directory if it doesn't exist
-    db_dir = os.path.dirname(os.path.abspath(DB_PATH))
-    if db_dir and not os.path.exists(db_dir):
-        os.makedirs(db_dir, exist_ok=True)
-        print(f"Created directory: {db_dir}")
-    
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    
-    # Create main table
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS excluded_instances (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            conversation_id TEXT NOT NULL,
-            latest_message_id TEXT NOT NULL,
-            user_email TEXT NOT NULL,
-            excluded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            reason TEXT,
-            UNIQUE(conversation_id, latest_message_id, user_email)
-        )
-    """)
-    
-    # Create indexes for faster lookups
-    cursor.execute("""
-        CREATE INDEX IF NOT EXISTS idx_conversation_message_user 
-        ON excluded_instances(conversation_id, latest_message_id, user_email)
-    """)
-    
-    cursor.execute("""
-        CREATE INDEX IF NOT EXISTS idx_conversation_user 
-        ON excluded_instances(conversation_id, user_email)
-    """)
-    
-    conn.commit()
-    
-    # Verify table was created
-    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='excluded_instances'")
-    table_exists = cursor.fetchone() is not None
-    
-    if table_exists:
-        cursor.execute("SELECT COUNT(*) FROM excluded_instances")
-        count = cursor.fetchone()[0]
+    try:
+        init_database()
+        count = get_total_exclusions()
+        
         print(f"✓ Database initialized successfully!")
+        print(f"  - Database Type: {db_type}")
         print(f"  - Table: excluded_instances")
         print(f"  - Existing records: {count}")
-    else:
-        print("✗ Error: Table was not created")
-    
-    conn.close()
-    return table_exists
+        return True
+    except Exception as e:
+        print(f"✗ Error: Database initialization failed - {str(e)}")
+        return False
 
 
 if __name__ == "__main__":
@@ -82,7 +44,7 @@ if __name__ == "__main__":
     print("Excluded Instances Database Initialization")
     print("=" * 60)
     
-    success = init_database()
+    success = setup_database()
     
     if success:
         print("\n✓ Database is ready to use!")

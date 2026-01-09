@@ -1,16 +1,25 @@
 """
 Webhook API Server for "Mark as Dealt With" Feature
-Handles storing and checking excluded email instances in SQLite database.
+Handles storing and checking excluded email instances in database (PostgreSQL or SQLite).
 """
 
 import os
 import sys
-import sqlite3
 import json
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict
 from flask import Flask, request, jsonify, make_response
 from flask_cors import CORS
+from db_utils import (
+    init_database,
+    check_exclusion_exists,
+    add_exclusion,
+    remove_exclusion,
+    get_exclusions_for_user,
+    cleanup_old_exclusions,
+    get_total_exclusions,
+    IS_POSTGRES
+)
 
 # Fix Windows console encoding
 if sys.platform == 'win32':
@@ -27,68 +36,20 @@ app = Flask(__name__)
 CORS(app)  # Enable CORS for cross-origin requests
 
 # Configuration
-DB_PATH = os.getenv("EXCLUSIONS_DB_PATH", "excluded_instances.db")
 API_KEY = os.getenv("WEBHOOK_API_KEY", None)  # Optional API key for authentication
 PORT = int(os.getenv("WEBHOOK_PORT", "5000"))
 HOST = os.getenv("WEBHOOK_HOST", "0.0.0.0")
-AUTO_CLEANUP_DAYS = 14  # Auto-delete exclusions older than this many days
+AUTO_CLEANUP_DAYS = int(os.getenv("AUTO_CLEANUP_DAYS", "14"))  # Auto-delete exclusions older than this many days
 
 
-def init_database():
-    """Initialize the SQLite database with the required schema."""
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS excluded_instances (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            conversation_id TEXT NOT NULL,
-            latest_message_id TEXT NOT NULL,
-            user_email TEXT NOT NULL,
-            excluded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            reason TEXT,
-            UNIQUE(conversation_id, latest_message_id, user_email)
-        )
-    """)
-    
-    # Create indexes for faster lookups
-    cursor.execute("""
-        CREATE INDEX IF NOT EXISTS idx_conversation_message_user 
-        ON excluded_instances(conversation_id, latest_message_id, user_email)
-    """)
-    
-    cursor.execute("""
-        CREATE INDEX IF NOT EXISTS idx_conversation_user 
-        ON excluded_instances(conversation_id, user_email)
-    """)
-    
-    conn.commit()
-    conn.close()
-    print(f"Database initialized at: {DB_PATH}")
-
-
-def cleanup_old_exclusions():
+def run_cleanup():
     """
     Auto-cleanup: Delete exclusions older than AUTO_CLEANUP_DAYS (default 14 days).
     This ensures the database doesn't grow indefinitely and old "dealt with" 
     items are automatically reopened if they become relevant again.
     """
     try:
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        
-        # Calculate cutoff date (14 days ago)
-        cutoff_date = (datetime.now(timezone.utc) - timedelta(days=AUTO_CLEANUP_DAYS)).isoformat()
-        
-        # Delete old records
-        cursor.execute("""
-            DELETE FROM excluded_instances
-            WHERE excluded_at < ?
-        """, (cutoff_date,))
-        
-        deleted_count = cursor.rowcount
-        conn.commit()
-        conn.close()
+        deleted_count = cleanup_old_exclusions(AUTO_CLEANUP_DAYS)
         
         if deleted_count > 0:
             print(f"✓ Auto-cleanup: Removed {deleted_count} exclusion(s) older than {AUTO_CLEANUP_DAYS} days")
@@ -339,18 +300,7 @@ def mark_dealt_with():
         }), 400
     
     try:
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        
-        # Insert or update (using INSERT OR REPLACE to handle duplicates)
-        cursor.execute("""
-            INSERT OR REPLACE INTO excluded_instances 
-            (conversation_id, latest_message_id, user_email, excluded_at, reason)
-            VALUES (?, ?, ?, ?, ?)
-        """, (conversation_id, latest_message_id, user_email.lower(), datetime.now(timezone.utc).isoformat(), reason))
-        
-        conn.commit()
-        conn.close()
+        add_exclusion(conversation_id, latest_message_id, user_email, reason)
         
         # Return nice HTML page for browser clicks
         if wants_html:
@@ -394,20 +344,7 @@ def check_excluded(conversation_id: str, latest_message_id: str, user_email: str
         return auth_error
     
     try:
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        
-        cursor.execute("""
-            SELECT id FROM excluded_instances
-            WHERE conversation_id = ? 
-            AND latest_message_id = ? 
-            AND user_email = ?
-        """, (conversation_id, latest_message_id, user_email.lower()))
-        
-        result = cursor.fetchone()
-        conn.close()
-        
-        excluded = result is not None
+        excluded = check_exclusion_exists(conversation_id, latest_message_id, user_email)
         
         return jsonify({
             "excluded": excluded,
@@ -434,18 +371,7 @@ def list_exclusions(user_email: str):
         return auth_error
     
     try:
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        
-        cursor.execute("""
-            SELECT conversation_id, latest_message_id, excluded_at, reason
-            FROM excluded_instances
-            WHERE user_email = ?
-            ORDER BY excluded_at DESC
-        """, (user_email.lower(),))
-        
-        results = cursor.fetchall()
-        conn.close()
+        results = get_exclusions_for_user(user_email)
         
         exclusions = []
         for row in results:
@@ -498,19 +424,7 @@ def undo_exclusion():
         }), 400
     
     try:
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        
-        cursor.execute("""
-            DELETE FROM excluded_instances
-            WHERE conversation_id = ? 
-            AND latest_message_id = ? 
-            AND user_email = ?
-        """, (conversation_id, latest_message_id, user_email.lower()))
-        
-        deleted_count = cursor.rowcount
-        conn.commit()
-        conn.close()
+        deleted_count = remove_exclusion(conversation_id, latest_message_id, user_email)
         
         if deleted_count > 0:
             return jsonify({
@@ -534,15 +448,12 @@ def undo_exclusion():
 def health_check():
     """Health check endpoint."""
     try:
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute("SELECT COUNT(*) FROM excluded_instances")
-        count = cursor.fetchone()[0]
-        conn.close()
+        count = get_total_exclusions()
+        db_type = "PostgreSQL" if IS_POSTGRES else "SQLite"
         
         return jsonify({
             "status": "healthy",
-            "database": DB_PATH,
+            "database_type": db_type,
             "total_exclusions": count
         }), 200
     except Exception as e:
@@ -557,13 +468,15 @@ if __name__ == "__main__":
     init_database()
     
     # Auto-cleanup old exclusions (14+ days old)
-    cleanup_old_exclusions()
+    run_cleanup()
+    
+    db_type = "PostgreSQL" if IS_POSTGRES else "SQLite"
     
     print(f"""
     ================================================================
     Mark as Dealt With API Server
     ================================================================
-    Database: {DB_PATH}
+    Database Type: {db_type}
     Host: {HOST}
     Port: {PORT}
     API Key Required: {'Yes' if API_KEY else 'No'}
@@ -580,5 +493,5 @@ if __name__ == "__main__":
     ================================================================
     """)
     
-    app.run(host=HOST, port=PORT, debug=True)
+    app.run(host=HOST, port=PORT, debug=False)
 

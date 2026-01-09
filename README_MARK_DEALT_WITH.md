@@ -1,24 +1,44 @@
-# Mark as Dealt With Feature
+# Email Reminders - Mark as Dealt With Feature
 
 This feature allows users to mark specific email instances as "dealt with" from the email digest, preventing them from appearing in future analyses until new messages arrive in the same thread.
 
+## 🚀 Production Deployment (Render)
+
+This project is configured for deployment on Render with:
+- **PostgreSQL Database** (auto-configured)
+- **Flask API Web Service** (mark as dealt with endpoints)
+- **Cron Job** running at **5:30 PM IST (12:00 UTC) daily**
+
+### Deploy to Render
+1. Push code to GitHub
+2. In Render Dashboard: New → Blueprint
+3. Connect repository: `AngadDograDesri/Email-Reminders-Render`
+4. Render auto-configures from `render.yml`
+5. Add required environment variables:
+   - `TENANT_ID`, `CLIENT_ID`, `CLIENT_SECRET` (Microsoft Azure)
+   - `OPENAI_API_KEY` (OpenAI)
+   - `USER_EMAILS` (comma-separated email addresses)
+
+### Verify Deployment
+```bash
+curl https://your-service.onrender.com/api/health
+```
+
+**See `render.yml` for complete deployment configuration.**
+
 ## Architecture
 
-The feature consists of three separate components:
+The feature consists of:
 
-1. **`mark_dealt_with_api.py`** - Webhook API server that handles storing/checking exclusions
-2. **`exclusion_checker.py`** - Helper module that can be imported by the analysis script
-3. **`init_exclusions_db.py`** - Database initialization script
+1. **`mark_dealt_with_api.py`** - Flask API server (stores/checks exclusions)
+2. **`exclusion_checker.py`** - Helper module for analysis script
+3. **`init_exclusions_db.py`** - Database initialization
+4. **`db_utils.py`** - Database abstraction (PostgreSQL/SQLite)
 
 ## Setup
 
 ### 1. Install Dependencies
 
-```bash
-pip install flask flask-cors
-```
-
-Or install all requirements:
 ```bash
 pip install -r requirements.txt
 ```
@@ -31,23 +51,34 @@ Run once to create the database:
 python init_exclusions_db.py
 ```
 
-This creates `excluded_instances.db` (or path specified in `EXCLUSIONS_DB_PATH` env var).
+**Production**: Automatically uses PostgreSQL (via `DATABASE_URL` env var)  
+**Local Dev**: Uses SQLite (`excluded_instances.db`)
 
 ### 3. Configure Environment Variables
 
-Add to your `.env` file:
+**Production (Render)**: Most variables are auto-configured in `render.yml`
+
+**Local Development** - Add to your `.env` file:
 
 ```env
-# Path to SQLite database for exclusions
+# Microsoft Azure (Required)
+TENANT_ID=your-tenant-id
+CLIENT_ID=your-client-id
+CLIENT_SECRET=your-client-secret
+
+# OpenAI (Required)
+OPENAI_API_KEY=your-openai-key
+
+# Users (Required)
+USER_EMAILS=user1@domain.com,user2@domain.com
+
+# Local Database (Optional - auto-detected)
 EXCLUSIONS_DB_PATH=excluded_instances.db
 
-# Webhook API server configuration (optional - for API mode)
+# API Configuration (Optional - for local testing)
 WEBHOOK_API_URL=http://localhost:5000
-WEBHOOK_API_KEY=your-secret-api-key-here  # Optional, for API authentication
-WEBHOOK_HOST=0.0.0.0
+WEBHOOK_HOST=127.0.0.1
 WEBHOOK_PORT=5000
-
-# How to check exclusions: "true" to use API, "false" to use direct DB access
 USE_EXCLUSION_API=false
 ```
 

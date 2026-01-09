@@ -39,10 +39,12 @@ services:
         fromDatabase:
           name: email-reminders-db
           property: connectionString
+      # Set this manually after deployment: https://{your-web-service-name}.onrender.com
+      # Example: https://email-reminders-api.onrender.com
       - key: WEBHOOK_API_URL
-        fromService:
-          type: web
-          name: email-reminders-api
-          property: url
+        sync: false
+      # Copy the auto-generated WEBHOOK_API_KEY from the web service after deployment
+      - key: WEBHOOK_API_KEY
+        sync: false
       - key: USE_EXCLUSION_API
         value: true

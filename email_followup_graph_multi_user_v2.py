@@ -52,6 +52,9 @@ RECENT_THRESHOLD_DAYS = 2  # Emails newer than this are "recent"
 GRAPH_API_ENDPOINT = "https://graph.microsoft.com/v1.0"
 LOCAL_TZ = tz.tzlocal()
 
+# Test limit - set to None for no limit, or a number to limit emails processed
+TEST_LIMIT = None  # No limit - process all emails
+
 # Priority Keywords for detection
 URGENT_KEYWORDS = [
     "urgent", "asap", "immediately", "critical", "emergency", "time-sensitive",
@@ -1268,11 +1271,8 @@ def build_section_table(entries: List[Dict], section_type: str) -> str:
         return ""
     
     # Different headers based on section type - WIDER COLUMNS for text-heavy content - STANDARDIZED FONT SIZE
-    if section_type == 'urgent':
-        extra_col = '<th style="border:1px solid #ddd; padding:12px; text-align:left; font-weight:bold; font-size:13px; width:25%;">Priority Keywords</th>'
-    elif section_type == 'recent_important':
-        extra_col = '<th style="border:1px solid #ddd; padding:12px; text-align:left; font-weight:bold; font-size:13px; width:25%;">Why Important</th>'
-    elif section_type == 'auto_closed':
+    # Only auto_closed section has an extra "Reason" column
+    if section_type == 'auto_closed':
         extra_col = '<th style="border:1px solid #ddd; padding:12px; text-align:left; font-weight:bold; font-size:13px; width:25%;">Reason</th>'
     else:
         extra_col = ''
@@ -1285,12 +1285,11 @@ def build_section_table(entries: List[Dict], section_type: str) -> str:
         <th style="border:1px solid #ddd; padding:10px; text-align:left; font-weight:bold; font-size:13px; width:14%;">Subject</th>
         <th style="border:1px solid #ddd; padding:10px; text-align:left; font-weight:bold; font-size:13px; width:8%;">Last From</th>
         <th style="border:1px solid #ddd; padding:10px; text-align:left; font-weight:bold; font-size:13px; width:4%;">Age</th>
-        <th style="border:1px solid #ddd; padding:10px; text-align:left; font-weight:bold; font-size:13px; width:20%;">Conversation Summary</th>
         <th style="border:1px solid #ddd; padding:10px; text-align:left; font-weight:bold; font-size:13px; width:10%;">Last Message (ET)</th>
+        <th style="border:1px solid #ddd; padding:10px; text-align:left; font-weight:bold; font-size:13px; width:20%;">Conversation Summary</th>
         {extra_col}
-        <th style="border:1px solid #ddd; padding:10px; text-align:left; font-weight:bold; font-size:13px; width:7%;">Action</th>
-        <th style="border:1px solid #ddd; padding:10px; text-align:left; font-weight:bold; font-size:13px; width:4%;">Link</th>
-        <th style="border:1px solid #ddd; padding:10px; text-align:center; font-weight:bold; font-size:13px; width:16%;">Mark as Dealt With</th>
+        <th style="border:1px solid #ddd; padding:10px; text-align:left; font-weight:bold; font-size:13px; width:7%;">Status</th>
+        <th style="border:1px solid #ddd; padding:10px; text-align:center; font-weight:bold; font-size:13px; width:16%;">Action</th>
         </tr>
     </thead>
     <tbody>
@@ -1302,16 +1301,26 @@ def build_section_table(entries: List[Dict], section_type: str) -> str:
         # NO TRUNCATION - show full subject
         subject_escaped = html.escape(subject_raw)
         
+        # Get web link for clickable subject
+        web_link = e.get("web_link", "")
+        
         # Visual indicator for low confidence (edge cases) - NO section icons on individual rows
         confidence = e.get("confidence", "medium")
         
         # Add confidence indicator only (no section icons on rows) - STANDARDIZED FONT SIZE
+        # Make subject clickable if web_link exists
         if confidence == "low":
             # Add a subtle indicator for edge cases
-            subject = f'<span style="font-size:13px; opacity:0.85; border-left:3px solid #ff9800; padding-left:5px; display:inline-block;">⚠️ {subject_escaped}</span>'
+            if web_link:
+                subject = f'<a href="{html.escape(web_link)}" style="color:#0066cc; text-decoration:none; font-size:13px; opacity:0.85; border-left:3px solid #ff9800; padding-left:5px; display:inline-block;">⚠️ {subject_escaped}</a>'
+            else:
+                subject = f'<span style="font-size:13px; opacity:0.85; border-left:3px solid #ff9800; padding-left:5px; display:inline-block;">⚠️ {subject_escaped}</span>'
         else:
             # No icon, just the subject with consistent font size
-            subject = f'<span style="font-size:13px;">{subject_escaped}</span>'
+            if web_link:
+                subject = f'<a href="{html.escape(web_link)}" style="color:#0066cc; text-decoration:none; font-size:13px;">{subject_escaped}</a>'
+            else:
+                subject = f'<span style="font-size:13px;">{subject_escaped}</span>'
         
         # Last message from - format as proper name - STANDARDIZED FONT SIZE
         last_msg_from = e.get("last_msg_from", "") or "N/A"
@@ -1337,31 +1346,14 @@ def build_section_table(entries: List[Dict], section_type: str) -> str:
         last_msg_et = format_datetime_et(last_msg_date) if last_msg_date else "N/A"
         last_msg_et_html = f'<span style="font-size:13px; color:#666;">{html.escape(last_msg_et)}</span>'
         
-        # Extra column content - STANDARDIZED FONT SIZE
-        if section_type == 'urgent':
-            urgency_reason = e.get("urgency_reason", "")
-            keywords = e.get("priority_keywords", [])
-            
-            if urgency_reason:
-                # Show FULL AI urgency reason (primary) - AI understands urgency from context
-                extra_content = f'<span style="color:#d32f2f; font-size:13px; line-height:1.4;">{html.escape(urgency_reason)}</span>'
-            elif keywords:
-                # Fallback: show keywords if AI didn't provide reason (shouldn't happen if urgent)
-                extra_content = f'<span style="color:#d32f2f; font-size:13px;">Keywords: {", ".join(keywords)}</span>'
-            else:
-                extra_content = '<span style="color:#d32f2f; font-size:13px;">AI-detected urgency</span>'
-        elif section_type == 'recent_important':
-            # Show FULL AI reason without truncation - this explains why it's important
-            reason = e.get("ai_reason", "") or "Needs attention"
-            extra_content = f'<span style="font-size:13px; line-height:1.4;">{html.escape(reason)}</span>'
-        elif section_type == 'auto_closed':
+        # Extra column content - only for auto_closed section
+        if section_type == 'auto_closed':
             # Show reason for auto-closure
             reason = e.get("reason", "") or "Inactive for 14+ days"
             extra_content = f'<span style="font-size:13px; line-height:1.4; color:#666;">{html.escape(reason)}</span>'
+            extra_cell = f'<td style="border:1px solid #ddd; padding:8px; vertical-align:top;">{extra_content}</td>'
         else:
-            extra_content = ''
-        
-        extra_cell = f'<td style="border:1px solid #ddd; padding:8px; vertical-align:top;">{extra_content}</td>' if extra_col else ''
+            extra_cell = ''
         
         # Action needed (with color coding) - STANDARDIZED FONT SIZE (12px for badges)
         if section_type == 'auto_closed':
@@ -1375,13 +1367,6 @@ def build_section_table(entries: List[Dict], section_type: str) -> str:
                 action_style = "background-color:#e3f2fd; color:#1565c0; font-weight:bold; padding:4px 8px; border-radius:4px; font-size:12px;"
         action_html = f'<span style="{action_style}">{html.escape(action_needed)}</span>'
         
-        # Web link - STANDARDIZED FONT SIZE
-        web_link = e.get("web_link", "")
-        if web_link:
-            link_html = f'<a href="{html.escape(web_link)}" style="color:#0066cc; text-decoration:none; font-weight:500; font-size:13px;">Open</a>'
-        else:
-            link_html = '<span style="font-size:13px;">N/A</span>'
-            
         # "Mark as Dealt With" button - Simple table-based, green background, clickable
         conv_id = e.get("conversation_id", "")
         msg_id = e.get("latest_message_id", "")
@@ -1400,11 +1385,10 @@ def build_section_table(entries: List[Dict], section_type: str) -> str:
         <td style="border:1px solid #ddd; padding:8px; vertical-align:top;">{subject}</td>
         <td style="border:1px solid #ddd; padding:8px; vertical-align:top;">{last_msg_from_html}</td>
         <td style="border:1px solid #ddd; padding:8px; vertical-align:top; text-align:center;">{age_str_html}</td>
-        <td style="border:1px solid #ddd; padding:8px; vertical-align:top;">{conversation_summary_html}</td>
         <td style="border:1px solid #ddd; padding:8px; vertical-align:top;">{last_msg_et_html}</td>
+        <td style="border:1px solid #ddd; padding:8px; vertical-align:top;">{conversation_summary_html}</td>
         {extra_cell}
         <td style="border:1px solid #ddd; padding:8px; vertical-align:top;">{action_html}</td>
-        <td style="border:1px solid #ddd; padding:8px; vertical-align:top;">{link_html}</td>
         <td style="border:1px solid #ddd; padding:8px; vertical-align:top; text-align:center;">{mark_dealt_html}</td>
         </tr>
         """
@@ -1553,21 +1537,8 @@ def build_enhanced_digest(urgent_emails: List[Dict], recent_important: List[Dict
       </div>
         """
     
-    # Footer with legend
+    # Close main container
     digest_html += """
-      <div style="border:1px solid #ddd; border-top:none; padding:15px; background:#fafafa; border-radius:0 0 8px 8px;">
-        <h3 style="margin:0 0 10px 0; font-size:13px; color:#333;">📋 Legend</h3>
-        <table style="font-size:13px; color:#666;">
-          <tr>
-            <td style="padding:3px 15px 3px 0;"><span style="background-color:#ffebee; color:#c62828; padding:2px 6px; border-radius:3px; font-weight:bold;">You need to reply</span></td>
-            <td>The last message is FROM someone else - they're waiting for YOUR response</td>
-          </tr>
-          <tr>
-            <td style="padding:3px 15px 3px 0;"><span style="background-color:#e3f2fd; color:#1565c0; padding:2px 6px; border-radius:3px; font-weight:bold;">Waiting for reply</span></td>
-            <td>The last message is FROM you - you're waiting for THEIR response</td>
-          </tr>
-        </table>
-      </div>
     </div>
     """
     
@@ -1606,6 +1577,11 @@ def analyze_user_mailbox(user_email: str, graph_client: GraphAPIClient, analyzer
     # Get sent messages
     sent_messages = graph_client.get_sent_messages(user_email, lookback_date)
     print(f"Found {len(sent_messages)} sent messages")
+    
+    # Apply test limit if set
+    if TEST_LIMIT:
+        sent_messages = sent_messages[:TEST_LIMIT]
+        print(f"⚠️ TEST MODE: Limiting to first {TEST_LIMIT} emails")
     
     # Process messages - categorize into 4 groups
     urgent_emails = []        # Has priority keywords AND needs action

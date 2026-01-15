@@ -41,11 +41,21 @@ def init_database():
             conversation_id TEXT NOT NULL,
             latest_message_id TEXT NOT NULL,
             user_email TEXT NOT NULL,
+            subject TEXT,
             excluded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             reason TEXT,
             UNIQUE(conversation_id, latest_message_id, user_email)
         )
     """)
+    
+    # Migration: Add 'subject' column if it doesn't exist (for existing databases)
+    try:
+        cursor.execute("SELECT subject FROM excluded_instances LIMIT 1")
+    except sqlite3.OperationalError:
+        # Column doesn't exist, add it
+        print("Migrating database: Adding 'subject' column...")
+        cursor.execute("ALTER TABLE excluded_instances ADD COLUMN subject TEXT")
+        print("✓ Migration complete: 'subject' column added")
     
     # Create indexes for faster lookups
     cursor.execute("""

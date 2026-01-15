@@ -45,11 +45,21 @@ def init_database():
             conversation_id TEXT NOT NULL,
             latest_message_id TEXT NOT NULL,
             user_email TEXT NOT NULL,
+            subject TEXT,
             excluded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             reason TEXT,
             UNIQUE(conversation_id, latest_message_id, user_email)
         )
     """)
+    
+    # Migration: Add 'subject' column if it doesn't exist (for existing databases)
+    try:
+        cursor.execute("SELECT subject FROM excluded_instances LIMIT 1")
+    except sqlite3.OperationalError:
+        # Column doesn't exist, add it
+        print("Migrating database: Adding 'subject' column...")
+        cursor.execute("ALTER TABLE excluded_instances ADD COLUMN subject TEXT")
+        print("✓ Migration complete: 'subject' column added")
     
     # Create indexes for faster lookups
     cursor.execute("""
@@ -102,8 +112,11 @@ def cleanup_old_exclusions():
         return 0
 
 
-def generate_success_html(user_email: str) -> str:
+def generate_success_html(user_email: str, subject: str = "") -> str:
     """Generate a nice HTML success page instead of raw JSON."""
+    import html
+    escaped_subject = html.escape(subject[:80]) + ("..." if len(subject) > 80 else "") if subject else ""
+    subject_html = f'<p style="color:#333; font-size:14px; margin-top:15px;"><strong>Subject:</strong> {escaped_subject}</p>' if subject else ""
     return f"""
     <!DOCTYPE html>
     <html>
@@ -187,6 +200,7 @@ def generate_success_html(user_email: str) -> str:
             <h1>Marked as Dealt With!</h1>
             <p>This email has been successfully marked as dealt with.</p>
             <p>It will be <strong>skipped</strong> in future digests until new messages arrive.</p>
+            {subject_html}
             <p class="email">{user_email}</p>
             <p class="close-hint">You can close this tab now.</p>
         </div>
@@ -297,6 +311,7 @@ def mark_dealt_with():
     - conversationId (required)
     - latestMessageId (required)
     - userEmail (required)
+    - subject (optional) - email subject for convenience
     - reason (optional)
     
     Can be called via GET (query params) or POST (JSON body)
@@ -319,11 +334,13 @@ def mark_dealt_with():
         conversation_id = data.get("conversationId") or data.get("conversation_id")
         latest_message_id = data.get("latestMessageId") or data.get("latest_message_id")
         user_email = data.get("userEmail") or data.get("user_email")
+        subject = data.get("subject", "")
         reason = data.get("reason", "")
     else:  # GET
         conversation_id = request.args.get("conversationId") or request.args.get("conversation_id")
         latest_message_id = request.args.get("latestMessageId") or request.args.get("latest_message_id")
         user_email = request.args.get("userEmail") or request.args.get("user_email")
+        subject = request.args.get("subject", "")
         reason = request.args.get("reason", "")
     
     # Validate required parameters
@@ -345,16 +362,16 @@ def mark_dealt_with():
         # Insert or update (using INSERT OR REPLACE to handle duplicates)
         cursor.execute("""
             INSERT OR REPLACE INTO excluded_instances 
-            (conversation_id, latest_message_id, user_email, excluded_at, reason)
-            VALUES (?, ?, ?, ?, ?)
-        """, (conversation_id, latest_message_id, user_email.lower(), datetime.now(timezone.utc).isoformat(), reason))
+            (conversation_id, latest_message_id, user_email, subject, excluded_at, reason)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (conversation_id, latest_message_id, user_email.lower(), subject, datetime.now(timezone.utc).isoformat(), reason))
         
         conn.commit()
         conn.close()
         
         # Return nice HTML page for browser clicks
         if wants_html:
-            response = make_response(generate_success_html(user_email), 200)
+            response = make_response(generate_success_html(user_email, subject), 200)
             response.headers['Content-Type'] = 'text/html'
             return response
         
@@ -438,7 +455,7 @@ def list_exclusions(user_email: str):
         cursor = conn.cursor()
         
         cursor.execute("""
-            SELECT conversation_id, latest_message_id, excluded_at, reason
+            SELECT conversation_id, latest_message_id, subject, excluded_at, reason
             FROM excluded_instances
             WHERE user_email = ?
             ORDER BY excluded_at DESC
@@ -452,8 +469,9 @@ def list_exclusions(user_email: str):
             exclusions.append({
                 "conversationId": row[0],
                 "latestMessageId": row[1],
-                "excludedAt": row[2],
-                "reason": row[3]
+                "subject": row[2],
+                "excludedAt": row[3],
+                "reason": row[4]
             })
         
         return jsonify({

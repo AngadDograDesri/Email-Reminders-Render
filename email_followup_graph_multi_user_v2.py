@@ -17,6 +17,7 @@ from dateutil import parser as date_parser
 from dateutil import tz
 import html
 import re
+from urllib.parse import quote
 
 try:
     from dotenv import load_dotenv
@@ -509,7 +510,7 @@ class EmailAnalyzer:
     """Analyzes emails to determine if they require a reply - V2 with full conversation analysis."""
     
     # Latest GPT model - using GPT-4o (update to gpt-5.2 when confirmed available)
-    MODEL = "gpt-5.2"
+    MODEL = "gpt-4o"
     
     def __init__(self, openai_api_key: str):
         self.openai_client = openai.OpenAI(api_key=openai_api_key)
@@ -1371,9 +1372,12 @@ def build_section_table(entries: List[Dict], section_type: str) -> str:
         conv_id = e.get("conversation_id", "")
         msg_id = e.get("latest_message_id", "")
         email = e.get("user_email", "")
+        subject_for_url = e.get("subject", "")
 
         if conv_id and msg_id and email:
-            mark_dealt_url = f"{html.escape(WEBHOOK_API_URL)}/api/mark-dealt-with?conversationId={html.escape(conv_id)}&latestMessageId={html.escape(msg_id)}&userEmail={html.escape(email)}"
+            # URL-encode the subject to handle special characters
+            encoded_subject = quote(subject_for_url, safe='')
+            mark_dealt_url = f"{html.escape(WEBHOOK_API_URL)}/api/mark-dealt-with?conversationId={html.escape(conv_id)}&latestMessageId={html.escape(msg_id)}&userEmail={html.escape(email)}&subject={encoded_subject}"
             # Simple table button - green background, white text, fully clickable
             mark_dealt_html = f'''<table border="0" cellspacing="0" cellpadding="0"><tr><td bgcolor="#4CAF50" style="padding:8px 12px;"><a href="{mark_dealt_url}" target="_blank" style="color:#ffffff;font-family:Segoe UI,Arial,sans-serif;font-size:11px;font-weight:bold;text-decoration:none;white-space:nowrap;">✓ Mark as Dealt With</a></td></tr></table>'''
         else:

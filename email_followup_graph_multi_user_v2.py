@@ -1906,8 +1906,8 @@ def analyze_user_mailbox(user_email: str, graph_client: GraphAPIClient, analyzer
                 skipped_count += 1
                 # Update the processed_conversations with result
                 if conversation_id in processed_conversations:
-                    processed_conversations[conversation_id]['result'] = f"no_action: {ai_reason[:30]}"
-                print(f"  -> No action needed: {ai_reason[:50]}...")
+                    processed_conversations[conversation_id]['result'] = f"no_action: {ai_reason}"
+                print(f"  -> No action needed: {ai_reason}")
                 continue
             
             # Check for urgency (only if action is needed) - AI is PRIMARY, keywords are for display/context only

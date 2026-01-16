@@ -509,7 +509,7 @@ class GraphAPIClient:
 class EmailAnalyzer:
     """Analyzes emails to determine if they require a reply - V2 with full conversation analysis."""
     
-    # Latest GPT model - using GPT-4o (update to gpt-5.2 when confirmed available)
+    # Latest GPT model
     MODEL = "gpt-4o"
     
     def __init__(self, openai_api_key: str):
@@ -2011,7 +2011,8 @@ def main():
     
     # Team members to analyze
     TEAM_MEMBERS = [
-        "peter.koczanski@desri.com"
+        "peter.koczanski@desri.com",
+        "russell.petrella@desri.com"
     ]
     
     # Email where drafts will be created

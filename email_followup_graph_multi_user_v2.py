@@ -7,10 +7,30 @@ but haven't received them within 2 days.
 import os
 import sys
 import json
+import io
 
 # Fix Windows console encoding for emojis
 if sys.platform == 'win32':
     sys.stdout.reconfigure(encoding='utf-8')
+
+
+class TeeOutput:
+    """Class to duplicate stdout to both console and a file."""
+    def __init__(self, log_file_path):
+        self.terminal = sys.stdout
+        self.log_file = open(log_file_path, 'w', encoding='utf-8')
+    
+    def write(self, message):
+        self.terminal.write(message)
+        self.log_file.write(message)
+        self.log_file.flush()  # Ensure immediate write
+    
+    def flush(self):
+        self.terminal.flush()
+        self.log_file.flush()
+    
+    def close(self):
+        self.log_file.close()
 import datetime as dt
 from typing import List, Dict, Optional, Tuple
 from dateutil import parser as date_parser
@@ -2009,6 +2029,14 @@ def main():
     """Main function to analyze multiple team members' mailboxes and create draft emails."""
     from datetime import datetime
     
+    # Set up file logging - creates a log file with timestamp
+    log_filename = f"email_analysis_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+    tee_output = TeeOutput(log_filename)
+    sys.stdout = tee_output
+    
+    print(f"📝 Logging output to: {log_filename}")
+    print(f"📅 Run started at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+    
     # Team members to analyze
     TEAM_MEMBERS = [
         "peter.koczanski@desri.com",
@@ -2134,7 +2162,14 @@ def main():
     
     print(f"\n{'='*80}")
     print(f"✅ Analysis complete! Check {DRAFT_RECIPIENT_EMAIL}'s Drafts folder for all reports.")
+    print(f"📅 Run completed at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"📝 Full log saved to: {log_filename}")
     print(f"{'='*80}\n")
+    
+    # Close the log file and restore stdout
+    sys.stdout = tee_output.terminal
+    tee_output.close()
+    print(f"Log file saved: {log_filename}")
 
 
 if __name__ == "__main__":

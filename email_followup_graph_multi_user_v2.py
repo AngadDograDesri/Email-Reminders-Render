@@ -2062,20 +2062,26 @@ def fetch_users_from_api() -> Optional[List[str]]:
         return None
 
 
-def fetch_access_token_from_api(user_email: str) -> Optional[str]:
-    """Fetch access token for user from the API. Returns None on failure."""
+def fetch_access_token_from_api(user_email: str) -> Tuple[Optional[str], Optional[str]]:
+    """Fetch access token for user from the API. Returns (token, None) or (None, hint)."""
     if not INTERNAL_API_KEY or not WEBHOOK_API_URL:
-        return None
+        return (None, None)
     base = WEBHOOK_API_URL.rstrip("/")
     url = f"{base}/api/internal/token/{quote(user_email)}"
     try:
         r = requests.get(url, headers={"X-Internal-Api-Key": INTERNAL_API_KEY}, timeout=30)
         if not r.ok:
-            return None
+            hint = None
+            try:
+                data = r.json()
+                hint = data.get("hint")
+            except Exception:
+                pass
+            return (None, hint)
         data = r.json()
-        return data.get("access_token")
+        return (data.get("access_token"), None)
     except Exception:
-        return None
+        return (None, None)
 
 
 def main():
@@ -2154,9 +2160,10 @@ def main():
         
         try:
             if use_api_token_mode:
-                access_token = fetch_access_token_from_api(team_member_email)
+                access_token, hint = fetch_access_token_from_api(team_member_email)
                 if not access_token:
-                    print(f"✗ Could not get access token for {team_member_email}; skipping.")
+                    hint_str = f" (hint: {hint})" if hint else ""
+                    print(f"✗ Could not get access token for {team_member_email}; skipping.{hint_str}")
                     continue
                 graph_client = GraphAPIClient.from_access_token(access_token, team_member_email)
             else:

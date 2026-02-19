@@ -400,17 +400,20 @@ def _store_refresh_token(user_email: str, encrypted: bytes) -> None:
             )
 
 
-def get_access_token_for_user(user_email: str) -> Optional[str]:
+def get_access_token_for_user(user_email: str) -> Tuple[Optional[str], Optional[str]]:
     """
     Get a valid access token for the user by refreshing from stored refresh token.
-    Returns access_token or None if no token or refresh fails.
+    Returns (access_token, None) on success, or (None, hint) on failure.
+    hint: "no_stored_token", "decrypt_failed", "missing_config", "refresh_failed".
     """
     encrypted = _get_stored_refresh_token(user_email)
     if not encrypted:
-        return None
+        return (None, "no_stored_token")
     refresh_token = _decrypt_refresh_token(encrypted)
-    if not refresh_token or not AZURE_CLIENT_ID or not AZURE_CLIENT_SECRET or not AZURE_TENANT_ID:
-        return None
+    if not refresh_token:
+        return (None, "decrypt_failed")
+    if not AZURE_CLIENT_ID or not AZURE_CLIENT_SECRET or not AZURE_TENANT_ID:
+        return (None, "missing_config")
     try:
         from msal import ConfidentialClientApplication
         authority = f"https://login.microsoftonline.com/{AZURE_TENANT_ID}"
@@ -429,10 +432,10 @@ def get_access_token_for_user(user_email: str) -> Optional[str]:
                 enc_new = _encrypt_refresh_token(result["refresh_token"])
                 if enc_new:
                     _store_refresh_token(user_email, enc_new)
-            return result["access_token"]
+            return (result["access_token"], None)
+        return (None, "refresh_failed")
     except Exception:
-        pass
-    return None
+        return (None, "refresh_failed")
 
 
 def check_api_key():
@@ -553,9 +556,9 @@ def internal_token(user_email: str):
     err = require_internal_api_key()
     if err:
         return err
-    access_token = get_access_token_for_user(user_email)
+    access_token, hint = get_access_token_for_user(user_email)
     if not access_token:
-        return jsonify({"error": "No token or refresh failed"}), 404
+        return jsonify({"error": "No token or refresh failed", "hint": hint or "refresh_failed"}), 404
     return jsonify({"access_token": access_token})
 
 

@@ -2065,6 +2065,7 @@ def fetch_users_from_api() -> Optional[List[str]]:
 def fetch_access_token_from_api(user_email: str) -> Tuple[Optional[str], Optional[str]]:
     """Fetch access token for user from the API. Returns (token, None) or (None, hint)."""
     if not INTERNAL_API_KEY or not WEBHOOK_API_URL:
+        print(f"  [Token API] Skipped: INTERNAL_API_KEY or WEBHOOK_API_URL not set")
         return (None, None)
     base = WEBHOOK_API_URL.rstrip("/")
     url = f"{base}/api/internal/token/{quote(user_email)}"
@@ -2072,15 +2073,19 @@ def fetch_access_token_from_api(user_email: str) -> Tuple[Optional[str], Optiona
         r = requests.get(url, headers={"X-Internal-Api-Key": INTERNAL_API_KEY}, timeout=30)
         if not r.ok:
             hint = None
+            err_msg = None
             try:
                 data = r.json()
                 hint = data.get("hint")
+                err_msg = data.get("error")
             except Exception:
-                pass
+                err_msg = r.text[:200] if r.text else None
+            print(f"  [Token API] HTTP {r.status_code} for {user_email}: hint={hint!r} error={err_msg!r}")
             return (None, hint)
         data = r.json()
         return (data.get("access_token"), None)
-    except Exception:
+    except Exception as e:
+        print(f"  [Token API] Request failed for {user_email}: {type(e).__name__}: {e}")
         return (None, None)
 
 

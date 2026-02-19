@@ -343,11 +343,12 @@ def generate_error_html(error_message: str) -> str:
 # ----- Token encryption and OAuth -----
 def _get_fernet():
     """Return Fernet instance for TOKEN_ENCRYPTION_KEY, or None if not configured."""
-    if not TOKEN_ENCRYPTION_KEY:
+    raw = (TOKEN_ENCRYPTION_KEY or "").strip() if isinstance(TOKEN_ENCRYPTION_KEY, str) else TOKEN_ENCRYPTION_KEY
+    if not raw:
         return None
     try:
         from cryptography.fernet import Fernet
-        key = TOKEN_ENCRYPTION_KEY.encode("utf-8") if isinstance(TOKEN_ENCRYPTION_KEY, str) else TOKEN_ENCRYPTION_KEY
+        key = raw.encode("utf-8") if isinstance(raw, str) else raw
         return Fernet(key)
     except Exception:
         return None

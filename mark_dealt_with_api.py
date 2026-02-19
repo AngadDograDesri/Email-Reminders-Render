@@ -1,6 +1,8 @@
 """
 Webhook API Server for "Mark as Dealt With" Feature
-Handles storing and checking excluded email instances in SQLite database.
+Handles storing and checking excluded email instances.
+Supports SQLite (default) or PostgreSQL when DATABASE_URL is set.
+OAuth (Azure) and encrypted token storage for delegated mailbox access.
 """
 
 import os
@@ -8,8 +10,9 @@ import sys
 import sqlite3
 import json
 from datetime import datetime, timedelta, timezone
-from typing import Optional, Dict
-from flask import Flask, request, jsonify, make_response
+from typing import Optional, Dict, Any, List, Tuple
+from contextlib import contextmanager
+from flask import Flask, request, jsonify, make_response, redirect, session
 from flask_cors import CORS
 
 # Fix Windows console encoding
@@ -24,89 +27,133 @@ except ImportError:
     print("Warning: python-dotenv not installed. Make sure to set environment variables manually.")
 
 app = Flask(__name__)
-CORS(app)  # Enable CORS for cross-origin requests
+app.secret_key = os.getenv("FLASK_SECRET_KEY", os.urandom(24).hex())
+CORS(app, supports_credentials=True)
 
 # Configuration
+DATABASE_URL = os.getenv("DATABASE_URL")
 DB_PATH = os.getenv("EXCLUSIONS_DB_PATH", "excluded_instances.db")
-API_KEY = os.getenv("WEBHOOK_API_KEY", None)  # Optional API key for authentication
+API_KEY = os.getenv("WEBHOOK_API_KEY", None)
 PORT = int(os.getenv("WEBHOOK_PORT", "5000"))
 HOST = os.getenv("WEBHOOK_HOST", "0.0.0.0")
-AUTO_CLEANUP_DAYS = 14  # Auto-delete exclusions older than this many days
+AUTO_CLEANUP_DAYS = 14
+
+# OAuth / token storage
+TOKEN_ENCRYPTION_KEY = os.getenv("TOKEN_ENCRYPTION_KEY")
+INTERNAL_API_KEY = os.getenv("INTERNAL_API_KEY")
+REDIRECT_URI = os.getenv("REDIRECT_URI")
+AZURE_CLIENT_ID = os.getenv("AZURE_CLIENT_ID")
+AZURE_CLIENT_SECRET = os.getenv("AZURE_CLIENT_SECRET")
+AZURE_TENANT_ID = os.getenv("AZURE_TENANT_ID")
+
+USE_POSTGRES = bool(DATABASE_URL)
+
+
+def get_connection():
+    """Return a database connection (SQLite or Postgres)."""
+    if USE_POSTGRES:
+        import psycopg2
+        return psycopg2.connect(DATABASE_URL)
+    return sqlite3.connect(DB_PATH)
+
+
+@contextmanager
+def db_cursor(commit: bool = True):
+    """Context manager for DB cursor. Use ? for SQLite, %s for Postgres."""
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        yield cur
+        if commit:
+            conn.commit()
+    finally:
+        cur.close()
+        conn.close()
+
+
+def _param_style() -> str:
+    """Return placeholder style: ? for SQLite, %s for Postgres."""
+    return "?" if not USE_POSTGRES else "%s"
 
 
 def init_database():
-    """Initialize the SQLite database with the required schema."""
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS excluded_instances (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            conversation_id TEXT NOT NULL,
-            latest_message_id TEXT NOT NULL,
-            user_email TEXT NOT NULL,
-            subject TEXT,
-            excluded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            reason TEXT,
-            UNIQUE(conversation_id, latest_message_id, user_email)
+    """Initialize database (SQLite or Postgres) with required schema."""
+    with db_cursor(commit=True) as cur:
+        if USE_POSTGRES:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS excluded_instances (
+                    id SERIAL PRIMARY KEY,
+                    conversation_id TEXT NOT NULL,
+                    latest_message_id TEXT NOT NULL,
+                    user_email TEXT NOT NULL,
+                    subject TEXT,
+                    excluded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    reason TEXT,
+                    UNIQUE(conversation_id, latest_message_id, user_email)
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS user_tokens (
+                    user_email TEXT PRIMARY KEY,
+                    encrypted_refresh_token BYTEA NOT NULL,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+        else:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS excluded_instances (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    conversation_id TEXT NOT NULL,
+                    latest_message_id TEXT NOT NULL,
+                    user_email TEXT NOT NULL,
+                    subject TEXT,
+                    excluded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    reason TEXT,
+                    UNIQUE(conversation_id, latest_message_id, user_email)
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS user_tokens (
+                    user_email TEXT PRIMARY KEY,
+                    encrypted_refresh_token BLOB NOT NULL,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+
+        # Migration: Add 'subject' to excluded_instances if missing (SQLite only)
+        if not USE_POSTGRES:
+            try:
+                cur.execute("SELECT subject FROM excluded_instances LIMIT 1")
+            except sqlite3.OperationalError:
+                cur.execute("ALTER TABLE excluded_instances ADD COLUMN subject TEXT")
+
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_conversation_message_user ON excluded_instances(conversation_id, latest_message_id, user_email)"
         )
-    """)
-    
-    # Migration: Add 'subject' column if it doesn't exist (for existing databases)
-    try:
-        cursor.execute("SELECT subject FROM excluded_instances LIMIT 1")
-    except sqlite3.OperationalError:
-        # Column doesn't exist, add it
-        print("Migrating database: Adding 'subject' column...")
-        cursor.execute("ALTER TABLE excluded_instances ADD COLUMN subject TEXT")
-        print("✓ Migration complete: 'subject' column added")
-    
-    # Create indexes for faster lookups
-    cursor.execute("""
-        CREATE INDEX IF NOT EXISTS idx_conversation_message_user 
-        ON excluded_instances(conversation_id, latest_message_id, user_email)
-    """)
-    
-    cursor.execute("""
-        CREATE INDEX IF NOT EXISTS idx_conversation_user 
-        ON excluded_instances(conversation_id, user_email)
-    """)
-    
-    conn.commit()
-    conn.close()
-    print(f"Database initialized at: {DB_PATH}")
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_conversation_user ON excluded_instances(conversation_id, user_email)"
+        )
+    print(f"Database initialized: {'Postgres' if USE_POSTGRES else DB_PATH}")
 
 
 def cleanup_old_exclusions():
     """
     Auto-cleanup: Delete exclusions older than AUTO_CLEANUP_DAYS (default 14 days).
-    This ensures the database doesn't grow indefinitely and old "dealt with" 
-    items are automatically reopened if they become relevant again.
     """
     try:
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        
-        # Calculate cutoff date (14 days ago)
+        p = _param_style()
         cutoff_date = (datetime.now(timezone.utc) - timedelta(days=AUTO_CLEANUP_DAYS)).isoformat()
-        
-        # Delete old records
-        cursor.execute("""
-            DELETE FROM excluded_instances
-            WHERE excluded_at < ?
-        """, (cutoff_date,))
-        
-        deleted_count = cursor.rowcount
-        conn.commit()
-        conn.close()
-        
+        with db_cursor() as cur:
+            cur.execute(
+                f"DELETE FROM excluded_instances WHERE excluded_at < {p}",
+                (cutoff_date,)
+            )
+            deleted_count = cur.rowcount
         if deleted_count > 0:
             print(f"✓ Auto-cleanup: Removed {deleted_count} exclusion(s) older than {AUTO_CLEANUP_DAYS} days")
         else:
             print(f"✓ Auto-cleanup: No old exclusions to remove")
-            
         return deleted_count
-        
     except Exception as e:
         print(f"⚠ Auto-cleanup error: {str(e)}")
         return 0
@@ -293,6 +340,101 @@ def generate_error_html(error_message: str) -> str:
     """
 
 
+# ----- Token encryption and OAuth -----
+def _get_fernet():
+    """Return Fernet instance for TOKEN_ENCRYPTION_KEY, or None if not configured."""
+    if not TOKEN_ENCRYPTION_KEY:
+        return None
+    try:
+        from cryptography.fernet import Fernet
+        key = TOKEN_ENCRYPTION_KEY.encode("utf-8") if isinstance(TOKEN_ENCRYPTION_KEY, str) else TOKEN_ENCRYPTION_KEY
+        return Fernet(key)
+    except Exception:
+        return None
+
+
+def _encrypt_refresh_token(token: str) -> Optional[bytes]:
+    """Encrypt refresh token for storage. Returns None if encryption not configured."""
+    f = _get_fernet()
+    if not f:
+        return None
+    return f.encrypt(token.encode("utf-8"))
+
+
+def _decrypt_refresh_token(encrypted: bytes) -> Optional[str]:
+    """Decrypt stored refresh token."""
+    f = _get_fernet()
+    if not f:
+        return None
+    try:
+        return f.decrypt(encrypted).decode("utf-8")
+    except Exception:
+        return None
+
+
+def _get_stored_refresh_token(user_email: str) -> Optional[bytes]:
+    """Return encrypted refresh token for user, or None."""
+    p = _param_style()
+    with db_cursor() as cur:
+        cur.execute(f"SELECT encrypted_refresh_token FROM user_tokens WHERE user_email = {p}", (user_email.lower(),))
+        row = cur.fetchone()
+    return row[0] if row else None
+
+
+def _store_refresh_token(user_email: str, encrypted: bytes) -> None:
+    """Upsert encrypted refresh token for user."""
+    p = _param_style()
+    now = datetime.now(timezone.utc).isoformat()
+    if USE_POSTGRES:
+        with db_cursor() as cur:
+            cur.execute("""
+                INSERT INTO user_tokens (user_email, encrypted_refresh_token, updated_at)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (user_email) DO UPDATE SET encrypted_refresh_token = EXCLUDED.encrypted_refresh_token, updated_at = EXCLUDED.updated_at
+            """, (user_email.lower(), encrypted, now))
+    else:
+        with db_cursor() as cur:
+            cur.execute(
+                "INSERT OR REPLACE INTO user_tokens (user_email, encrypted_refresh_token, updated_at) VALUES (?, ?, ?)",
+                (user_email.lower(), encrypted, now)
+            )
+
+
+def get_access_token_for_user(user_email: str) -> Optional[str]:
+    """
+    Get a valid access token for the user by refreshing from stored refresh token.
+    Returns access_token or None if no token or refresh fails.
+    """
+    encrypted = _get_stored_refresh_token(user_email)
+    if not encrypted:
+        return None
+    refresh_token = _decrypt_refresh_token(encrypted)
+    if not refresh_token or not AZURE_CLIENT_ID or not AZURE_CLIENT_SECRET or not AZURE_TENANT_ID:
+        return None
+    try:
+        from msal import ConfidentialClientApplication
+        authority = f"https://login.microsoftonline.com/{AZURE_TENANT_ID}"
+        app = ConfidentialClientApplication(
+            AZURE_CLIENT_ID,
+            authority=authority,
+            client_credential=AZURE_CLIENT_SECRET,
+        )
+        SCOPES = ["https://graph.microsoft.com/Mail.Read", "https://graph.microsoft.com/Mail.ReadWrite", "https://graph.microsoft.com/Mail.Send"]
+        result = app.acquire_token_by_refresh_token(
+            refresh_token,
+            scopes=SCOPES,
+        )
+        if result and "access_token" in result:
+            if "refresh_token" in result:
+                enc_new = _encrypt_refresh_token(result["refresh_token"])
+                if enc_new:
+                    _store_refresh_token(user_email, enc_new)
+            return result["access_token"]
+    except Exception:
+        pass
+    return None
+
+
 def check_api_key():
     """Check if API key is required and validate it."""
     if API_KEY:
@@ -300,6 +442,129 @@ def check_api_key():
         if provided_key != API_KEY:
             return jsonify({"error": "Invalid API key"}), 401
     return None
+
+
+def require_internal_api_key():
+    """Require X-Internal-Api-Key header; return 401 response if missing or wrong."""
+    if not INTERNAL_API_KEY:
+        return jsonify({"error": "Internal API not configured"}), 503
+    key = request.headers.get("X-Internal-Api-Key")
+    if key != INTERNAL_API_KEY:
+        return jsonify({"error": "Unauthorized"}), 401
+    return None
+
+
+# ----- OAuth and internal token endpoints -----
+@app.route("/auth/start", methods=["GET"])
+def auth_start():
+    """Redirect user to Azure sign-in. After callback, refresh token is stored for that user."""
+    if not all([AZURE_CLIENT_ID, AZURE_CLIENT_SECRET, AZURE_TENANT_ID, REDIRECT_URI]):
+        return make_response(generate_error_html("OAuth not configured (missing AZURE_* or REDIRECT_URI)"), 500)
+    try:
+        from msal import ConfidentialClientApplication
+        import secrets
+        authority = f"https://login.microsoftonline.com/{AZURE_TENANT_ID}"
+        app = ConfidentialClientApplication(
+            AZURE_CLIENT_ID,
+            authority=authority,
+            client_credential=AZURE_CLIENT_SECRET,
+        )
+        state = secrets.token_urlsafe(32)
+        session["oauth_state"] = state
+        auth_url = app.get_authorization_request_url(
+            scopes=["https://graph.microsoft.com/Mail.Read", "https://graph.microsoft.com/Mail.ReadWrite", "https://graph.microsoft.com/Mail.Send"],
+            state=state,
+            redirect_uri=REDIRECT_URI,
+        )
+        return redirect(auth_url)
+    except Exception as e:
+        return make_response(generate_error_html(str(e)), 500)
+
+
+@app.route("/auth/callback", methods=["GET"])
+def auth_callback():
+    """Exchange code for tokens, store encrypted refresh token, show success."""
+    if not all([AZURE_CLIENT_ID, AZURE_CLIENT_SECRET, AZURE_TENANT_ID, REDIRECT_URI]):
+        return make_response(generate_error_html("OAuth not configured"), 500)
+    state = request.args.get("state")
+    if state != session.get("oauth_state"):
+        return make_response(generate_error_html("Invalid state"), 400)
+    code = request.args.get("code")
+    if not code:
+        err = request.args.get("error_description") or request.args.get("error") or "No code"
+        return make_response(generate_error_html(err), 400)
+    try:
+        from msal import ConfidentialClientApplication
+        authority = f"https://login.microsoftonline.com/{AZURE_TENANT_ID}"
+        app = ConfidentialClientApplication(
+            AZURE_CLIENT_ID,
+            authority=authority,
+            client_credential=AZURE_CLIENT_SECRET,
+        )
+        result = app.acquire_token_by_authorization_code(
+            code,
+            scopes=["https://graph.microsoft.com/Mail.Read", "https://graph.microsoft.com/Mail.ReadWrite", "https://graph.microsoft.com/Mail.Send"],
+            redirect_uri=REDIRECT_URI,
+        )
+        if not result or "access_token" not in result:
+            return make_response(generate_error_html("Failed to get tokens"), 500)
+        refresh_token = result.get("refresh_token")
+        if not refresh_token:
+            return make_response(generate_error_html("No refresh token in response"), 500)
+        # Get user email from id_token or /me
+        user_email = None
+        if result.get("id_token_claims"):
+            user_email = (result["id_token_claims"].get("preferred_username") or result["id_token_claims"].get("upn"))
+        if not user_email and result.get("access_token"):
+            import requests
+            r = requests.get(
+                "https://graph.microsoft.com/v1.0/me",
+                headers={"Authorization": f"Bearer {result['access_token']}"},
+                params={"$select": "mail,userPrincipalName"},
+            )
+            if r.ok:
+                j = r.json()
+                user_email = j.get("mail") or j.get("userPrincipalName")
+        if not user_email:
+            return make_response(generate_error_html("Could not determine user email"), 500)
+        encrypted = _encrypt_refresh_token(refresh_token)
+        if not encrypted:
+            return make_response(generate_error_html("Token encryption not configured (TOKEN_ENCRYPTION_KEY)"), 500)
+        _store_refresh_token(user_email, encrypted)
+        session.pop("oauth_state", None)
+        return make_response("""
+        <!DOCTYPE html><html><head><title>Success</title></head><body>
+        <h1>Signed in successfully</h1>
+        <p>Your mailbox is now connected for the email digest. You can close this tab.</p>
+        <p>User: """ + user_email + """</p>
+        </body></html>""", 200)
+    except Exception as e:
+        return make_response(generate_error_html(str(e)), 500)
+
+
+@app.route("/api/internal/token/<path:user_email>", methods=["GET"])
+def internal_token(user_email: str):
+    """Return access token for user (for cron). Requires X-Internal-Api-Key header."""
+    err = require_internal_api_key()
+    if err:
+        return err
+    access_token = get_access_token_for_user(user_email)
+    if not access_token:
+        return jsonify({"error": "No token or refresh failed"}), 404
+    return jsonify({"access_token": access_token})
+
+
+@app.route("/api/internal/users", methods=["GET"])
+def internal_users():
+    """Return list of user emails that have stored tokens. Requires X-Internal-Api-Key header."""
+    err = require_internal_api_key()
+    if err:
+        return err
+    with db_cursor() as cur:
+        cur.execute("SELECT user_email FROM user_tokens ORDER BY user_email")
+        rows = cur.fetchall()
+    users = [r[0] for r in rows]
+    return jsonify({"users": users})
 
 
 @app.route("/api/mark-dealt-with", methods=["POST", "GET"])
@@ -355,19 +620,24 @@ def mark_dealt_with():
             "error": error_msg
         }), 400
     
+    p = _param_style()
     try:
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        
-        # Insert or update (using INSERT OR REPLACE to handle duplicates)
-        cursor.execute("""
-            INSERT OR REPLACE INTO excluded_instances 
-            (conversation_id, latest_message_id, user_email, subject, excluded_at, reason)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, (conversation_id, latest_message_id, user_email.lower(), subject, datetime.now(timezone.utc).isoformat(), reason))
-        
-        conn.commit()
-        conn.close()
+        if USE_POSTGRES:
+            with db_cursor() as cur:
+                cur.execute("""
+                    INSERT INTO excluded_instances 
+                    (conversation_id, latest_message_id, user_email, subject, excluded_at, reason)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (conversation_id, latest_message_id, user_email)
+                    DO UPDATE SET subject = EXCLUDED.subject, excluded_at = EXCLUDED.excluded_at, reason = EXCLUDED.reason
+                """, (conversation_id, latest_message_id, user_email.lower(), subject, datetime.now(timezone.utc).isoformat(), reason))
+        else:
+            with db_cursor() as cur:
+                cur.execute("""
+                    INSERT OR REPLACE INTO excluded_instances 
+                    (conversation_id, latest_message_id, user_email, subject, excluded_at, reason)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                """, (conversation_id, latest_message_id, user_email.lower(), subject, datetime.now(timezone.utc).isoformat(), reason))
         
         # Return nice HTML page for browser clicks
         if wants_html:
@@ -410,20 +680,14 @@ def check_excluded(conversation_id: str, latest_message_id: str, user_email: str
     if auth_error:
         return auth_error
     
+    p = _param_style()
     try:
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        
-        cursor.execute("""
-            SELECT id FROM excluded_instances
-            WHERE conversation_id = ? 
-            AND latest_message_id = ? 
-            AND user_email = ?
-        """, (conversation_id, latest_message_id, user_email.lower()))
-        
-        result = cursor.fetchone()
-        conn.close()
-        
+        with db_cursor() as cur:
+            cur.execute(
+                f"SELECT id FROM excluded_instances WHERE conversation_id = {p} AND latest_message_id = {p} AND user_email = {p}",
+                (conversation_id, latest_message_id, user_email.lower())
+            )
+            result = cur.fetchone()
         excluded = result is not None
         
         return jsonify({
@@ -450,20 +714,14 @@ def list_exclusions(user_email: str):
     if auth_error:
         return auth_error
     
+    p = _param_style()
     try:
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        
-        cursor.execute("""
-            SELECT conversation_id, latest_message_id, subject, excluded_at, reason
-            FROM excluded_instances
-            WHERE user_email = ?
-            ORDER BY excluded_at DESC
-        """, (user_email.lower(),))
-        
-        results = cursor.fetchall()
-        conn.close()
-        
+        with db_cursor() as cur:
+            cur.execute(
+                f"SELECT conversation_id, latest_message_id, subject, excluded_at, reason FROM excluded_instances WHERE user_email = {p} ORDER BY excluded_at DESC",
+                (user_email.lower(),)
+            )
+            results = cur.fetchall()
         exclusions = []
         for row in results:
             exclusions.append({
@@ -515,21 +773,14 @@ def undo_exclusion():
             "error": "Missing required parameters: conversationId, latestMessageId, and userEmail are required"
         }), 400
     
+    p = _param_style()
     try:
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        
-        cursor.execute("""
-            DELETE FROM excluded_instances
-            WHERE conversation_id = ? 
-            AND latest_message_id = ? 
-            AND user_email = ?
-        """, (conversation_id, latest_message_id, user_email.lower()))
-        
-        deleted_count = cursor.rowcount
-        conn.commit()
-        conn.close()
-        
+        with db_cursor() as cur:
+            cur.execute(
+                f"DELETE FROM excluded_instances WHERE conversation_id = {p} AND latest_message_id = {p} AND user_email = {p}",
+                (conversation_id, latest_message_id, user_email.lower())
+            )
+            deleted_count = cur.rowcount
         if deleted_count > 0:
             return jsonify({
                 "success": True,
@@ -552,15 +803,12 @@ def undo_exclusion():
 def health_check():
     """Health check endpoint."""
     try:
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute("SELECT COUNT(*) FROM excluded_instances")
-        count = cursor.fetchone()[0]
-        conn.close()
-        
+        with db_cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM excluded_instances")
+            count = cur.fetchone()[0]
         return jsonify({
             "status": "healthy",
-            "database": DB_PATH,
+            "database": "postgres" if USE_POSTGRES else DB_PATH,
             "total_exclusions": count
         }), 200
     except Exception as e:
@@ -581,13 +829,18 @@ if __name__ == "__main__":
     ================================================================
     Mark as Dealt With API Server
     ================================================================
-    Database: {DB_PATH}
+    Database: {'Postgres' if USE_POSTGRES else DB_PATH}
     Host: {HOST}
     Port: {PORT}
     API Key Required: {'Yes' if API_KEY else 'No'}
     Auto-Cleanup: {AUTO_CLEANUP_DAYS} days
+    OAuth: {'Yes' if all([AZURE_CLIENT_ID, AZURE_CLIENT_SECRET, AZURE_TENANT_ID, REDIRECT_URI]) else 'No'}
     
     Endpoints:
+    - GET /auth/start (OAuth sign-in)
+    - GET /auth/callback (OAuth callback)
+    - GET /api/internal/token/<user_email> (internal; X-Internal-Api-Key)
+    - GET /api/internal/users (internal; X-Internal-Api-Key)
     - POST/GET /api/mark-dealt-with (returns HTML for browser, JSON for API)
     - GET /api/check-excluded/<conversationId>/<latestMessageId>/<userEmail>
     - GET /api/exclusions/<userEmail>

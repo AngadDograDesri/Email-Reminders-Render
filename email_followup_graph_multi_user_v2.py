@@ -93,12 +93,13 @@ ACTION_KEYWORDS = [
 
 # Environment variables
 CLIENT_ID = os.getenv("AZURE_CLIENT_ID")
-CLIENT_SECRET = os.getenv("AZURE_CLIENT_SECRET")  # For app-only auth (LESS SECURE - see below)
+CLIENT_SECRET = os.getenv("AZURE_CLIENT_SECRET")  # For app-only auth (optional when using API token mode)
 TENANT_ID = os.getenv("AZURE_TENANT_ID")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 USER_EMAIL = os.getenv("USER_EMAIL")  # Only used for app-only auth (ignored in delegated mode)
-# Webhook API URL for "Mark as Dealt With" feature
+# Webhook API URL for "Mark as Dealt With" feature; also base URL for internal token API
 WEBHOOK_API_URL = os.getenv("WEBHOOK_API_URL", "http://localhost:5000")
+INTERNAL_API_KEY = os.getenv("INTERNAL_API_KEY")  # When set, cron gets tokens from API (no CLIENT_SECRET needed)
 
 # For interactive auth (if not using app-only)
 AUTHORITY = f"https://login.microsoftonline.com/{TENANT_ID}" if TENANT_ID else "https://login.microsoftonline.com/common"
@@ -123,7 +124,24 @@ USE_DELEGATED_AUTH = not bool(CLIENT_SECRET)
 
 class GraphAPIClient:
     """Microsoft Graph API client for accessing Outlook mailbox."""
-    
+
+    @classmethod
+    def from_access_token(cls, access_token: str, user_email: str) -> "GraphAPIClient":
+        """
+        Create a client that uses a pre-obtained access token (e.g. from the API).
+        No MSAL; token is used as-is. user_email is the mailbox owner (for /users/{email} or /me).
+        """
+        instance = cls.__new__(cls)
+        instance.client_id = None
+        instance.client_secret = None  # Treated as delegated: use /me for draft/send
+        instance.tenant_id = None
+        instance.authority = None
+        instance.access_token = access_token
+        instance.authenticated_user_email = user_email
+        instance.app = None
+        instance._token_only = True
+        return instance
+
     def __init__(self, client_id: str, client_secret: Optional[str] = None, tenant_id: Optional[str] = None):
         self.client_id = client_id
         self.client_secret = client_secret
@@ -132,7 +150,8 @@ class GraphAPIClient:
         self.access_token = None
         self.authenticated_user_email = None  # Set after authentication (delegated auth only)
         self.app = None
-        
+        self._token_only = False
+
         if client_secret:
             # App-only authentication (client credentials flow)
             # ⚠️ SECURITY WARNING: This mode can access ANY mailbox in the tenant!
@@ -151,6 +170,8 @@ class GraphAPIClient:
     
     def get_access_token(self) -> str:
         """Get access token for Microsoft Graph API."""
+        if getattr(self, "_token_only", False) and self.access_token:
+            return self.access_token
         if self.client_secret:
             # Client credentials flow (app-only)
             result = self.app.acquire_token_for_client(scopes=["https://graph.microsoft.com/.default"])
@@ -2025,6 +2046,38 @@ def analyze_user_mailbox(user_email: str, graph_client: GraphAPIClient, analyzer
     return urgent_emails, recent_important, hanging_emails, auto_closed_emails, stats
 
 
+def fetch_users_from_api() -> Optional[List[str]]:
+    """Fetch list of user emails that have tokens from the API. Returns None on failure."""
+    if not INTERNAL_API_KEY or not WEBHOOK_API_URL:
+        return None
+    base = WEBHOOK_API_URL.rstrip("/")
+    url = f"{base}/api/internal/users"
+    try:
+        r = requests.get(url, headers={"X-Internal-Api-Key": INTERNAL_API_KEY}, timeout=30)
+        if not r.ok:
+            return None
+        data = r.json()
+        return data.get("users") or []
+    except Exception:
+        return None
+
+
+def fetch_access_token_from_api(user_email: str) -> Optional[str]:
+    """Fetch access token for user from the API. Returns None on failure."""
+    if not INTERNAL_API_KEY or not WEBHOOK_API_URL:
+        return None
+    base = WEBHOOK_API_URL.rstrip("/")
+    url = f"{base}/api/internal/token/{quote(user_email)}"
+    try:
+        r = requests.get(url, headers={"X-Internal-Api-Key": INTERNAL_API_KEY}, timeout=30)
+        if not r.ok:
+            return None
+        data = r.json()
+        return data.get("access_token")
+    except Exception:
+        return None
+
+
 def main():
     """Main function to analyze multiple team members' mailboxes and create draft emails."""
     from datetime import datetime
@@ -2037,58 +2090,80 @@ def main():
     print(f"📝 Logging output to: {log_filename}")
     print(f"📅 Run started at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
     
-    # Team members to analyze
+    # Team members to analyze (fallback when not using API token mode or when API returns no users)
     TEAM_MEMBERS = [
-        "peter.koczanski@desri.com",
-        "russell.petrella@desri.com"
+        "Vikas.Agrawal@desri.com"
     ]
     
-    # Email where drafts will be created
+    # Email where drafts will be created (app-only mode: all drafts go here; API token mode: draft in each user's mailbox)
     DRAFT_RECIPIENT_EMAIL = "arshdeep.kaur@desri.com"
     
     # Validate environment variables
-    if not CLIENT_ID:
-        print("Error: AZURE_CLIENT_ID not set in environment variables")
-        sys.exit(1)
-    
     if not OPENAI_API_KEY:
         print("Error: OPENAI_API_KEY not set in environment variables")
         sys.exit(1)
     
-    # Check if using app-only auth (has client secret)
-    is_app_only_auth = bool(CLIENT_SECRET)
+    # API token mode: get users and tokens from API (no CLIENT_SECRET required)
+    use_api_token_mode = bool(INTERNAL_API_KEY and WEBHOOK_API_URL)
     
-    if not is_app_only_auth:
-        print("Error: This script requires app-only authentication (CLIENT_SECRET must be set)")
-        print("This is needed to access multiple mailboxes.")
-        sys.exit(1)
-    
-    # SECURITY WARNING for app-only auth
-    print("\n" + "="*70)
-    print("⚠️  SECURITY WARNING: App-Only Authentication Mode")
-    print("="*70)
-    print("You are using CLIENT_SECRET which enables app-only authentication.")
-    print("This mode can access ANY mailbox in your organization!")
-    print("="*70 + "\n")
-    
-    # Initialize clients
-    print("Initializing Microsoft Graph API client...")
-    graph_client = GraphAPIClient(CLIENT_ID, CLIENT_SECRET, TENANT_ID)
+    if use_api_token_mode:
+        users_to_analyze = fetch_users_from_api()
+        if not users_to_analyze:
+            users_to_analyze = TEAM_MEMBERS
+            print("Note: No users from API; using TEAM_MEMBERS fallback.")
+        if not CLIENT_ID:
+            print("Error: AZURE_CLIENT_ID still required in environment (for compatibility)")
+            sys.exit(1)
+        print("\n" + "="*70)
+        print("🔐 API Token Mode: Getting tokens from email-reminders API")
+        print("="*70)
+        print(f"Users to analyze: {users_to_analyze}")
+        print("="*70 + "\n")
+    else:
+        if not CLIENT_ID:
+            print("Error: AZURE_CLIENT_ID not set in environment variables")
+            sys.exit(1)
+        if not CLIENT_SECRET:
+            print("Error: This script requires either:")
+            print("  1) INTERNAL_API_KEY + WEBHOOK_API_URL (API token mode), or")
+            print("  2) AZURE_CLIENT_SECRET (app-only authentication)")
+            sys.exit(1)
+        users_to_analyze = TEAM_MEMBERS
+        print("\n" + "="*70)
+        print("⚠️  SECURITY WARNING: App-Only Authentication Mode")
+        print("="*70)
+        print("You are using CLIENT_SECRET which enables app-only authentication.")
+        print("This mode can access ANY mailbox in your organization!")
+        print("="*70 + "\n")
     
     print("Initializing OpenAI client...")
     analyzer = EmailAnalyzer(OPENAI_API_KEY)
     
-    print(f"\n📋 Analyzing {len(TEAM_MEMBERS)} team member(s)...")
-    print(f"📧 Draft emails will be created in: {DRAFT_RECIPIENT_EMAIL}")
+    print(f"\n📋 Analyzing {len(users_to_analyze)} team member(s)...")
+    if use_api_token_mode:
+        print("📧 Draft emails will be created in each user's own Drafts folder.")
+    else:
+        print(f"📧 Draft emails will be created in: {DRAFT_RECIPIENT_EMAIL}")
     print(f"{'='*80}\n")
     
     # Process each team member
-    for idx, team_member_email in enumerate(TEAM_MEMBERS, 1):
+    for idx, team_member_email in enumerate(users_to_analyze, 1):
         print(f"\n{'='*80}")
-        print(f"Processing {idx}/{len(TEAM_MEMBERS)}: {team_member_email}")
+        print(f"Processing {idx}/{len(users_to_analyze)}: {team_member_email}")
         print(f"{'='*80}")
         
         try:
+            if use_api_token_mode:
+                access_token = fetch_access_token_from_api(team_member_email)
+                if not access_token:
+                    print(f"✗ Could not get access token for {team_member_email}; skipping.")
+                    continue
+                graph_client = GraphAPIClient.from_access_token(access_token, team_member_email)
+            else:
+                if idx == 1:
+                    graph_client = GraphAPIClient(CLIENT_ID, CLIENT_SECRET, TENANT_ID)
+                # else reuse same graph_client for app-only (single client for all users)
+            
             # Analyze this user's mailbox
             urgent_emails, recent_important, hanging_emails, auto_closed_emails, stats = analyze_user_mailbox(
                 team_member_email, graph_client, analyzer
@@ -2114,9 +2189,8 @@ def main():
             # Build enhanced digest with user name in header
             full_body = build_enhanced_digest(urgent_emails, recent_important, hanging_emails, auto_closed_emails, stats, team_member_name)
             
-            # Create draft email in vikas's mailbox
+            # Create draft: API token mode -> in user's mailbox (/me); app-only -> in DRAFT_RECIPIENT_EMAIL's mailbox
             if total_attention > 0:
-                # Build subject line with counts
                 subject_parts = []
                 if urgent_emails:
                     subject_parts.append(f"{len(urgent_emails)} urgent")
@@ -2124,28 +2198,26 @@ def main():
                     subject_parts.append(f"{len(recent_important)} important")
                 if hanging_emails:
                     subject_parts.append(f"{len(hanging_emails)} hanging")
-                
                 subject = f"[Email Digest] {team_member_name} - {', '.join(subject_parts)} - {datetime.now().strftime('%b %d')}"
             else:
                 subject = f"[Email Digest] {team_member_name} - All caught up! - {datetime.now().strftime('%b %d')}"
             
-            print(f"Creating draft email in {DRAFT_RECIPIENT_EMAIL}'s mailbox...")
+            draft_owner = None if use_api_token_mode else DRAFT_RECIPIENT_EMAIL
+            draft_target = team_member_email if use_api_token_mode else DRAFT_RECIPIENT_EMAIL
+            print(f"Creating draft email in {draft_target}'s mailbox...")
             
             try:
-                draft = graph_client.create_draft_email(DRAFT_RECIPIENT_EMAIL, subject, full_body, DRAFT_RECIPIENT_EMAIL)
+                draft = graph_client.create_draft_email(DRAFT_RECIPIENT_EMAIL, subject, full_body, draft_owner)
                 draft_id = draft.get("id", "unknown")
                 print(f"✓ Draft email created successfully!")
                 print(f"  Draft ID: {draft_id}")
                 print(f"  Subject: {subject}")
-                print(f"  Check {DRAFT_RECIPIENT_EMAIL}'s Drafts folder in Outlook")
+                print(f"  Check {draft_target}'s Drafts folder in Outlook")
             except Exception as e:
                 error_msg = str(e)
                 print(f"✗ Error creating draft: {e}")
-                
                 if "403" in error_msg or "Forbidden" in error_msg or "Access is denied" in error_msg:
                     print("\n⚠ PERMISSION ERROR - Need Mail.ReadWrite permission")
-                
-                # Save to file as backup
                 try:
                     safe_name = team_member_email.replace("@", "_at_").replace(".", "_")
                     output_filename = f"email_digest_{safe_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html"
@@ -2161,7 +2233,10 @@ def main():
             continue
     
     print(f"\n{'='*80}")
-    print(f"✅ Analysis complete! Check {DRAFT_RECIPIENT_EMAIL}'s Drafts folder for all reports.")
+    if use_api_token_mode:
+        print("✅ Analysis complete! Check each user's Drafts folder for their report.")
+    else:
+        print(f"✅ Analysis complete! Check {DRAFT_RECIPIENT_EMAIL}'s Drafts folder for all reports.")
     print(f"📅 Run completed at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"📝 Full log saved to: {log_filename}")
     print(f"{'='*80}\n")

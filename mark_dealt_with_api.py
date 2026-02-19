@@ -419,7 +419,7 @@ def get_access_token_for_user(user_email: str) -> Optional[str]:
             authority=authority,
             client_credential=AZURE_CLIENT_SECRET,
         )
-        SCOPES = ["https://graph.microsoft.com/Mail.Read", "https://graph.microsoft.com/Mail.ReadWrite", "https://graph.microsoft.com/Mail.Send"]
+        SCOPES = ["https://graph.microsoft.com/Mail.Read", "https://graph.microsoft.com/Mail.ReadWrite"]
         result = app.acquire_token_by_refresh_token(
             refresh_token,
             scopes=SCOPES,
@@ -472,7 +472,7 @@ def auth_start():
         state = secrets.token_urlsafe(32)
         session["oauth_state"] = state
         auth_url = app.get_authorization_request_url(
-            scopes=["https://graph.microsoft.com/Mail.Read", "https://graph.microsoft.com/Mail.ReadWrite", "https://graph.microsoft.com/Mail.Send"],
+            scopes=["https://graph.microsoft.com/Mail.Read", "https://graph.microsoft.com/Mail.ReadWrite"],
             state=state,
             redirect_uri=REDIRECT_URI,
         )
@@ -503,11 +503,16 @@ def auth_callback():
         )
         result = app.acquire_token_by_authorization_code(
             code,
-            scopes=["https://graph.microsoft.com/Mail.Read", "https://graph.microsoft.com/Mail.ReadWrite", "https://graph.microsoft.com/Mail.Send"],
+            scopes=["https://graph.microsoft.com/Mail.Read", "https://graph.microsoft.com/Mail.ReadWrite"],
             redirect_uri=REDIRECT_URI,
         )
         if not result or "access_token" not in result:
-            return make_response(generate_error_html("Failed to get tokens"), 500)
+            err_msg = "Failed to get tokens"
+            if result and isinstance(result, dict):
+                err = result.get("error_description") or result.get("error")
+                if err:
+                    err_msg = str(err)
+            return make_response(generate_error_html(err_msg), 500)
         refresh_token = result.get("refresh_token")
         if not refresh_token:
             return make_response(generate_error_html("No refresh token in response"), 500)

@@ -576,6 +576,26 @@ def internal_users():
     return jsonify({"users": users})
 
 
+@app.route("/api/internal/clear-tokens", methods=["POST"])
+def internal_clear_tokens():
+    """
+    Delete all rows in user_tokens. Use when decrypt_failed persists (e.g. key was changed).
+    After calling, have every user sign in again at /auth/start.
+    Requires X-Internal-Api-Key header.
+    """
+    err = require_internal_api_key()
+    if err:
+        return err
+    with db_cursor() as cur:
+        cur.execute("DELETE FROM user_tokens")
+        deleted = cur.rowcount
+    return jsonify({
+        "ok": True,
+        "message": "All stored tokens cleared. Users must sign in again at /auth/start.",
+        "deleted_count": deleted
+    })
+
+
 @app.route("/api/mark-dealt-with", methods=["POST", "GET"])
 def mark_dealt_with():
     """

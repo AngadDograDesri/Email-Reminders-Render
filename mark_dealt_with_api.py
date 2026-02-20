@@ -124,8 +124,15 @@ def init_database():
                 )
             """)
 
-        # Migration: Add 'subject' to excluded_instances if missing (SQLite only)
-        if not USE_POSTGRES:
+        # Migration: Add 'subject' to excluded_instances if missing
+        if USE_POSTGRES:
+            cur.execute("""
+                SELECT 1 FROM information_schema.columns
+                WHERE table_name = 'excluded_instances' AND column_name = 'subject'
+            """)
+            if cur.fetchone() is None:
+                cur.execute("ALTER TABLE excluded_instances ADD COLUMN subject TEXT")
+        else:
             try:
                 cur.execute("SELECT subject FROM excluded_instances LIMIT 1")
             except sqlite3.OperationalError:

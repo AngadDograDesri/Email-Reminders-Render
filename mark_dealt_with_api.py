@@ -9,6 +9,8 @@ import os
 import sys
 import sqlite3
 import json
+import base64
+import hashlib
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, Any, List, Tuple
 from contextlib import contextmanager
@@ -342,16 +344,28 @@ def generate_error_html(error_message: str) -> str:
 
 # ----- Token encryption and OAuth -----
 def _get_fernet():
-    """Return Fernet instance for TOKEN_ENCRYPTION_KEY, or None if not configured."""
+    """
+    Return Fernet instance for token encryption.
+    Uses TOKEN_ENCRYPTION_KEY if set; otherwise derives key from INTERNAL_API_KEY
+    so the same key is used everywhere (avoids decrypt_failed across instances).
+    """
+    from cryptography.fernet import Fernet
     raw = (TOKEN_ENCRYPTION_KEY or "").strip() if isinstance(TOKEN_ENCRYPTION_KEY, str) else TOKEN_ENCRYPTION_KEY
-    if not raw:
-        return None
-    try:
-        from cryptography.fernet import Fernet
-        key = raw.encode("utf-8") if isinstance(raw, str) else raw
-        return Fernet(key)
-    except Exception:
-        return None
+    if raw:
+        try:
+            key = raw.encode("utf-8") if isinstance(raw, str) else raw
+            return Fernet(key)
+        except Exception:
+            pass
+    # Fallback: derive from INTERNAL_API_KEY so encrypt/decrypt always use same key
+    if INTERNAL_API_KEY:
+        try:
+            key_bytes = hashlib.sha256(INTERNAL_API_KEY.encode()).digest()
+            key = base64.urlsafe_b64encode(key_bytes).decode()
+            return Fernet(key.encode())
+        except Exception:
+            pass
+    return None
 
 
 def _encrypt_refresh_token(token: str) -> Optional[bytes]:
@@ -539,6 +553,12 @@ def auth_callback():
         encrypted = _encrypt_refresh_token(refresh_token)
         if not encrypted:
             return make_response(generate_error_html("Token encryption not configured (TOKEN_ENCRYPTION_KEY)"), 500)
+        # Ensure we can decrypt what we encrypted (catches wrong/inconsistent key)
+        if _decrypt_refresh_token(encrypted) != refresh_token:
+            return make_response(
+                generate_error_html("Token storage failed: encryption key problem. Please ask an admin to set TOKEN_ENCRYPTION_KEY to a valid Fernet key (44 chars) and try again."),
+                500,
+            )
         _store_refresh_token(user_email, encrypted)
         session.pop("oauth_state", None)
         return make_response("""

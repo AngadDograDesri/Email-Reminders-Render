@@ -43,6 +43,8 @@ AUTO_CLEANUP_DAYS = 14
 # OAuth / token storage
 TOKEN_ENCRYPTION_KEY = os.getenv("TOKEN_ENCRYPTION_KEY")
 INTERNAL_API_KEY = os.getenv("INTERNAL_API_KEY")
+# Set to "true" or "1" to store refresh tokens without encryption (avoids decrypt_failed; use only if DB is not exposed).
+STORE_TOKENS_PLAINTEXT = os.getenv("STORE_TOKENS_PLAINTEXT", "").strip().lower() in ("1", "true", "yes")
 REDIRECT_URI = os.getenv("REDIRECT_URI")
 AZURE_CLIENT_ID = os.getenv("AZURE_CLIENT_ID")
 AZURE_CLIENT_SECRET = os.getenv("AZURE_CLIENT_SECRET")
@@ -369,7 +371,9 @@ def _get_fernet():
 
 
 def _encrypt_refresh_token(token: str) -> Optional[bytes]:
-    """Encrypt refresh token for storage. Returns None if encryption not configured."""
+    """Encrypt refresh token for storage (or store plaintext if STORE_TOKENS_PLAINTEXT)."""
+    if STORE_TOKENS_PLAINTEXT:
+        return token.encode("utf-8")
     f = _get_fernet()
     if not f:
         return None
@@ -377,7 +381,12 @@ def _encrypt_refresh_token(token: str) -> Optional[bytes]:
 
 
 def _decrypt_refresh_token(encrypted: bytes) -> Optional[str]:
-    """Decrypt stored refresh token."""
+    """Decrypt stored refresh token (or return as-is if STORE_TOKENS_PLAINTEXT)."""
+    if STORE_TOKENS_PLAINTEXT:
+        try:
+            return encrypted.decode("utf-8")
+        except Exception:
+            return None
     f = _get_fernet()
     if not f:
         return None

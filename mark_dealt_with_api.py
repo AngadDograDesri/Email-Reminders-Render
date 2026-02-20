@@ -434,6 +434,13 @@ def _store_refresh_token(user_email: str, encrypted: bytes) -> None:
             )
 
 
+def _delete_user_token(user_email: str) -> None:
+    """Remove stored token for user (so they can sign in again and get a fresh one)."""
+    p = _param_style()
+    with db_cursor() as cur:
+        cur.execute(f"DELETE FROM user_tokens WHERE user_email = {p}", (user_email.lower(),))
+
+
 def get_access_token_for_user(user_email: str) -> Tuple[Optional[str], Optional[str]]:
     """
     Get a valid access token for the user by refreshing from stored refresh token.
@@ -445,6 +452,7 @@ def get_access_token_for_user(user_email: str) -> Tuple[Optional[str], Optional[
         return (None, "no_stored_token")
     refresh_token = _decrypt_refresh_token(encrypted)
     if not refresh_token:
+        _delete_user_token(user_email)
         if STORE_TOKENS_PLAINTEXT:
             return (None, "clear_tokens_and_sign_in_again")
         return (None, "decrypt_failed")

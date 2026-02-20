@@ -370,10 +370,14 @@ def _get_fernet():
     return None
 
 
+# Prefix for plaintext-stored tokens so we never confuse with Fernet ciphertext
+_PLAIN_PREFIX = b"PLAIN:"
+
+
 def _encrypt_refresh_token(token: str) -> Optional[bytes]:
-    """Encrypt refresh token for storage (or store plaintext if STORE_TOKENS_PLAINTEXT)."""
+    """Encrypt refresh token for storage (or store plaintext with prefix if STORE_TOKENS_PLAINTEXT)."""
     if STORE_TOKENS_PLAINTEXT:
-        return token.encode("utf-8")
+        return _PLAIN_PREFIX + token.encode("utf-8")
     f = _get_fernet()
     if not f:
         return None
@@ -382,16 +386,17 @@ def _encrypt_refresh_token(token: str) -> Optional[bytes]:
 
 def _decrypt_refresh_token(encrypted: bytes) -> Optional[str]:
     """
-    Read refresh token from stored bytes. Always try plaintext (UTF-8) first so that
-    tokens stored with STORE_TOKENS_PLAINTEXT work regardless of env at read time.
-    If that fails or doesn't look like a token, try Fernet decrypt.
+    Read refresh token from stored bytes. If stored with PLAIN: prefix, decode and return.
+    Otherwise try Fernet decrypt. Ensures bytes type (Postgres may return memoryview).
     """
-    try:
-        plain = encrypted.decode("utf-8")
-        if len(plain) >= 50:
-            return plain
-    except Exception:
-        pass
+    if encrypted is None:
+        return None
+    encrypted = bytes(encrypted)
+    if encrypted.startswith(_PLAIN_PREFIX):
+        try:
+            return encrypted[len(_PLAIN_PREFIX):].decode("utf-8")
+        except Exception:
+            return None
     f = _get_fernet()
     if not f:
         return None

@@ -381,13 +381,17 @@ def _encrypt_refresh_token(token: str) -> Optional[bytes]:
 
 
 def _decrypt_refresh_token(encrypted: bytes) -> Optional[str]:
-    """Decrypt stored refresh token (or return as-is if STORE_TOKENS_PLAINTEXT)."""
-    if STORE_TOKENS_PLAINTEXT:
-        try:
-            return encrypted.decode("utf-8")
-        except Exception:
-            # Stored data is likely old encrypted bytes; clear tokens and sign in again
-            return None
+    """
+    Read refresh token from stored bytes. Always try plaintext (UTF-8) first so that
+    tokens stored with STORE_TOKENS_PLAINTEXT work regardless of env at read time.
+    If that fails or doesn't look like a token, try Fernet decrypt.
+    """
+    try:
+        plain = encrypted.decode("utf-8")
+        if len(plain) >= 50:
+            return plain
+    except Exception:
+        pass
     f = _get_fernet()
     if not f:
         return None

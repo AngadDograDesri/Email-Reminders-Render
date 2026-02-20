@@ -386,6 +386,7 @@ def _decrypt_refresh_token(encrypted: bytes) -> Optional[str]:
         try:
             return encrypted.decode("utf-8")
         except Exception:
+            # Stored data is likely old encrypted bytes; clear tokens and sign in again
             return None
     f = _get_fernet()
     if not f:
@@ -428,13 +429,15 @@ def get_access_token_for_user(user_email: str) -> Tuple[Optional[str], Optional[
     """
     Get a valid access token for the user by refreshing from stored refresh token.
     Returns (access_token, None) on success, or (None, hint) on failure.
-    hint: "no_stored_token", "decrypt_failed", "missing_config", "refresh_failed".
+    hint: "no_stored_token", "decrypt_failed", "clear_tokens_and_sign_in_again", "missing_config", "refresh_failed".
     """
     encrypted = _get_stored_refresh_token(user_email)
     if not encrypted:
         return (None, "no_stored_token")
     refresh_token = _decrypt_refresh_token(encrypted)
     if not refresh_token:
+        if STORE_TOKENS_PLAINTEXT:
+            return (None, "clear_tokens_and_sign_in_again")
         return (None, "decrypt_failed")
     if not AZURE_CLIENT_ID or not AZURE_CLIENT_SECRET or not AZURE_TENANT_ID:
         return (None, "missing_config")

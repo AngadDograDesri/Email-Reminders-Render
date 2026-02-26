@@ -2147,7 +2147,7 @@ def main():
     
     print(f"\n📋 Analyzing {len(users_to_analyze)} team member(s)...")
     if use_api_token_mode:
-        print("📧 Draft emails will be created in each user's own Drafts folder.")
+        print("📧 Digest emails will be sent to each user's Inbox.")
     else:
         print(f"📧 Draft emails will be created in: {DRAFT_RECIPIENT_EMAIL}")
     print(f"{'='*80}\n")
@@ -2196,7 +2196,7 @@ def main():
             # Build enhanced digest with user name in header
             full_body = build_enhanced_digest(urgent_emails, recent_important, hanging_emails, auto_closed_emails, stats, team_member_name)
             
-            # Create draft: API token mode -> in user's mailbox (/me); app-only -> in DRAFT_RECIPIENT_EMAIL's mailbox
+            # Send digest: API token mode -> send to user's Inbox (delegated Mail.Send); app-only -> create draft in DRAFT_RECIPIENT_EMAIL's mailbox
             if total_attention > 0:
                 subject_parts = []
                 if urgent_emails:
@@ -2209,22 +2209,29 @@ def main():
             else:
                 subject = f"[Email Digest] {team_member_name} - All caught up! - {datetime.now().strftime('%b %d')}"
             
-            draft_owner = None if use_api_token_mode else DRAFT_RECIPIENT_EMAIL
-            draft_target = team_member_email if use_api_token_mode else DRAFT_RECIPIENT_EMAIL
-            print(f"Creating draft email in {draft_target}'s mailbox...")
-            
             try:
-                draft = graph_client.create_draft_email(DRAFT_RECIPIENT_EMAIL, subject, full_body, draft_owner)
-                draft_id = draft.get("id", "unknown")
-                print(f"✓ Draft email created successfully!")
-                print(f"  Draft ID: {draft_id}")
-                print(f"  Subject: {subject}")
-                print(f"  Check {draft_target}'s Drafts folder in Outlook")
+                if use_api_token_mode:
+                    # Send email to user's Inbox (requires delegated Mail.Send; user must have re-signed in with new scope)
+                    print(f"Sending digest email to {team_member_email}...")
+                    graph_client.send_email(team_member_email, subject, full_body)
+                    print(f"✓ Email sent successfully!")
+                    print(f"  Subject: {subject}")
+                    print(f"  Check {team_member_email}'s Inbox in Outlook")
+                else:
+                    # App-only: create draft in DRAFT_RECIPIENT_EMAIL's mailbox
+                    draft_owner = DRAFT_RECIPIENT_EMAIL
+                    print(f"Creating draft email in {DRAFT_RECIPIENT_EMAIL}'s mailbox...")
+                    draft = graph_client.create_draft_email(DRAFT_RECIPIENT_EMAIL, subject, full_body, draft_owner)
+                    draft_id = draft.get("id", "unknown")
+                    print(f"✓ Draft email created successfully!")
+                    print(f"  Draft ID: {draft_id}")
+                    print(f"  Subject: {subject}")
+                    print(f"  Check {DRAFT_RECIPIENT_EMAIL}'s Drafts folder in Outlook")
             except Exception as e:
                 error_msg = str(e)
-                print(f"✗ Error creating draft: {e}")
+                print(f"✗ Error sending/creating email: {e}")
                 if "403" in error_msg or "Forbidden" in error_msg or "Access is denied" in error_msg:
-                    print("\n⚠ PERMISSION ERROR - Need Mail.ReadWrite permission")
+                    print("\n⚠ PERMISSION ERROR - For send: need Mail.Send and user must re-sign in at /auth/start. For draft: need Mail.ReadWrite.")
                 try:
                     safe_name = team_member_email.replace("@", "_at_").replace(".", "_")
                     output_filename = f"email_digest_{safe_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html"
@@ -2241,7 +2248,7 @@ def main():
     
     print(f"\n{'='*80}")
     if use_api_token_mode:
-        print("✅ Analysis complete! Check each user's Drafts folder for their report.")
+        print("✅ Analysis complete! Digest emails have been sent to each user's Inbox.")
     else:
         print(f"✅ Analysis complete! Check {DRAFT_RECIPIENT_EMAIL}'s Drafts folder for all reports.")
     print(f"📅 Run completed at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")

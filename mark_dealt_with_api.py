@@ -473,7 +473,7 @@ def get_access_token_for_user(user_email: str) -> Tuple[Optional[str], Optional[
             authority=authority,
             client_credential=AZURE_CLIENT_SECRET,
         )
-        SCOPES = ["https://graph.microsoft.com/Mail.Read", "https://graph.microsoft.com/Mail.ReadWrite"]
+        SCOPES = ["https://graph.microsoft.com/Mail.Read", "https://graph.microsoft.com/Mail.ReadWrite", "https://graph.microsoft.com/Mail.Send"]
         result = app.acquire_token_by_refresh_token(
             refresh_token,
             scopes=SCOPES,
@@ -526,7 +526,7 @@ def auth_start():
         state = secrets.token_urlsafe(32)
         session["oauth_state"] = state
         auth_url = app.get_authorization_request_url(
-            scopes=["https://graph.microsoft.com/Mail.Read", "https://graph.microsoft.com/Mail.ReadWrite"],
+            scopes=["https://graph.microsoft.com/Mail.Read", "https://graph.microsoft.com/Mail.ReadWrite", "https://graph.microsoft.com/Mail.Send"],
             state=state,
             redirect_uri=REDIRECT_URI,
         )
@@ -557,7 +557,7 @@ def auth_callback():
         )
         result = app.acquire_token_by_authorization_code(
             code,
-            scopes=["https://graph.microsoft.com/Mail.Read", "https://graph.microsoft.com/Mail.ReadWrite"],
+            scopes=["https://graph.microsoft.com/Mail.Read", "https://graph.microsoft.com/Mail.ReadWrite", "https://graph.microsoft.com/Mail.Send"],
             redirect_uri=REDIRECT_URI,
         )
         if not result or "access_token" not in result:

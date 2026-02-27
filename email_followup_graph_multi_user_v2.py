@@ -271,6 +271,9 @@ class GraphAPIClient:
             
             raise Exception(error_msg)
         
+        # Graph sendMail returns 202/204 with empty body; avoid JSON decode error
+        if not response.text or not response.text.strip():
+            return {}
         return response.json()
     
     def get_user_info(self, user_email: Optional[str] = None) -> dict:
